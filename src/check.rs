@@ -10,9 +10,14 @@ use std::{
 const LATEST_URL: &str = "https://update.code.visualstudio.com/api/update/linux-x64/stable/latest";
 
 #[derive(Debug)]
-struct Release {
-    version: String,
-    commit: String,
+pub(crate) struct Release {
+    pub(crate) version: String,
+    pub(crate) commit: String,
+}
+
+pub(crate) struct InstalledRelease {
+    pub(crate) release: Release,
+    pub(crate) application: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -49,10 +54,13 @@ pub async fn run() -> Result<()> {
 async fn check_at(root: &Path, lookup_url: &str) -> Result<String> {
     let installed = installed_release(root)?;
     let latest = fetch_latest(lookup_url).await?;
-    describe(installed.as_ref(), &latest)
+    describe(
+        installed.as_ref().map(|installed| &installed.release),
+        &latest,
+    )
 }
 
-fn installed_release(root: &Path) -> Result<Option<Release>> {
+pub(crate) fn installed_release(root: &Path) -> Result<Option<InstalledRelease>> {
     let current = root.join("current");
     match fs::symlink_metadata(&current) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -99,9 +107,12 @@ fn installed_release(root: &Path) -> Result<Option<Release>> {
     {
         return Err("Managed version/build metadata does not match its release directory".into());
     }
-    Ok(Some(Release {
-        version: package.version,
-        commit: product.commit,
+    Ok(Some(InstalledRelease {
+        release: Release {
+            version: package.version,
+            commit: product.commit,
+        },
+        application,
     }))
 }
 
@@ -313,8 +324,9 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let application = installation(home.path(), absolute);
             let installed = installed_release(home.path()).unwrap().unwrap();
-            assert_eq!(installed.version, "1.100.0");
-            assert_eq!(installed.commit, COMMIT);
+            assert_eq!(installed.release.version, "1.100.0");
+            assert_eq!(installed.release.commit, COMMIT);
+            assert_eq!(installed.application, application);
             assert!(application.is_dir());
         }
     }

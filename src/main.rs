@@ -3,6 +3,7 @@ mod check;
 mod commands;
 mod config;
 mod install;
+mod status;
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -46,6 +47,7 @@ async fn main() -> install::Result<()> {
             install_vscode("latest").await?;
         }
         commands::Command::Check => check::run().await?,
+        commands::Command::Status => status::run()?,
         _ => {
             print!("Others")
         }
