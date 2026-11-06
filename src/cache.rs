@@ -220,6 +220,71 @@ impl DownloadCache {
     }
 }
 
+pub fn clean(config: &Config, apply: bool) -> Result<()> {
+    let root = &config.download_dir;
+    match fs::symlink_metadata(root) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(m) if !m.is_dir() => return Err("Cache root must be a real directory".into()),
+        Ok(_) => (),
+    }
+    let _lock = if apply {
+        let path = root.join("cache.lock");
+        if fs::symlink_metadata(&path).is_ok_and(|m| !m.is_file()) {
+            return Err("Cache lock must be a regular file".into());
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        FileExt::try_lock_exclusive(&lock)
+            .map_err(|e| format!("Cannot acquire cache lock: {e}"))?;
+        Some(lock)
+    } else {
+        None
+    };
+    let mut packages = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if let Some(package) = Package::read(&path) {
+            packages.push((path, package));
+        }
+    }
+    packages.sort_by_cached_key(|(_, package)| {
+        (
+            version_key(&package.version).unwrap(),
+            package.commit.clone(),
+        )
+    });
+    let mut kept = std::collections::HashSet::new();
+    for (path, package) in packages.into_iter().rev() {
+        let version = version_key(&package.version)?;
+        if kept.len() < config.max_cache_count && kept.insert(version) {
+            continue;
+        }
+        println!(
+            "{} cached package {}",
+            if apply { "Removing" } else { "Would remove" },
+            path.display()
+        );
+        if apply {
+            if Package::read(&path).is_none() {
+                return Err("Cache entry changed during cleanup".into());
+            }
+            fs::remove_file(path.join(ARCHIVE))?;
+            fs::remove_file(path.join(MANIFEST))?;
+            match fs::remove_dir(&path) {
+                Ok(()) => (),
+                Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn version_key(version: &str) -> Result<[u64; 3]> {
     install::validate_version(version)?;
     let parts = version

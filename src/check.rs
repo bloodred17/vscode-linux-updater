@@ -7,7 +7,8 @@ use std::{
     time::Duration,
 };
 
-const LATEST_URL: &str = "https://update.code.visualstudio.com/api/update/linux-x64/stable/latest";
+pub(crate) const LATEST_URL: &str =
+    "https://update.code.visualstudio.com/api/update/linux-x64/stable/latest";
 
 #[derive(Debug)]
 pub(crate) struct Release {
@@ -27,6 +28,12 @@ struct LatestMetadata {
     version: String,
     url: String,
     sha256hash: String,
+}
+
+pub(crate) struct VerifiedRelease {
+    pub(crate) release: Release,
+    pub(crate) url: reqwest::Url,
+    pub(crate) checksum: String,
 }
 
 #[derive(Deserialize)]
@@ -91,10 +98,14 @@ pub(crate) fn installed_release(root: &Path) -> Result<Option<InstalledRelease>>
         );
     }
 
+    release_at(&application).map(Some)
+}
+
+pub(crate) fn release_at(application: &Path) -> Result<InstalledRelease> {
     let package: PackageMetadata =
-        serde_json::from_slice(&read_metadata(&application, "resources/app/package.json")?)?;
+        serde_json::from_slice(&read_metadata(application, "resources/app/package.json")?)?;
     let product: ProductMetadata =
-        serde_json::from_slice(&read_metadata(&application, "resources/app/product.json")?)?;
+        serde_json::from_slice(&read_metadata(application, "resources/app/product.json")?)?;
     version_key(&package.version)?;
     validate_commit(&product.commit)?;
     let identity = format!("{}-{}", package.version, product.commit);
@@ -107,13 +118,13 @@ pub(crate) fn installed_release(root: &Path) -> Result<Option<InstalledRelease>>
     {
         return Err("Managed version/build metadata does not match its release directory".into());
     }
-    Ok(Some(InstalledRelease {
+    Ok(InstalledRelease {
         release: Release {
             version: package.version,
             commit: product.commit,
         },
-        application,
-    }))
+        application: application.to_owned(),
+    })
 }
 
 fn read_metadata(application: &Path, relative: &str) -> Result<Vec<u8>> {
@@ -131,6 +142,10 @@ fn read_metadata(application: &Path, relative: &str) -> Result<Vec<u8>> {
 }
 
 async fn fetch_latest(lookup_url: &str) -> Result<Release> {
+    Ok(fetch_verified(lookup_url).await?.release)
+}
+
+pub(crate) async fn fetch_verified(lookup_url: &str) -> Result<VerifiedRelease> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
@@ -155,9 +170,13 @@ async fn fetch_latest(lookup_url: &str) -> Result<Release> {
     if !commit.eq_ignore_ascii_case(&metadata.version) {
         return Err("Latest Stable metadata and download URL identify different builds".into());
     }
-    Ok(Release {
-        version: metadata.product_version,
-        commit: metadata.version,
+    Ok(VerifiedRelease {
+        release: Release {
+            version: metadata.product_version,
+            commit: metadata.version.to_ascii_lowercase(),
+        },
+        url,
+        checksum: metadata.sha256hash,
     })
 }
 
@@ -168,7 +187,7 @@ fn validate_commit(commit: &str) -> Result<()> {
     Ok(())
 }
 
-fn version_key(version: &str) -> Result<[u64; 3]> {
+pub(crate) fn version_key(version: &str) -> Result<[u64; 3]> {
     install::validate_version(version)?;
     let parts = version
         .split('.')

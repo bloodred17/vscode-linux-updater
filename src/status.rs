@@ -21,7 +21,7 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn status_at(root: &Path, command: &Path, paths: &[PathBuf]) -> Result<String> {
+pub(crate) fn status_at(root: &Path, command: &Path, paths: &[PathBuf]) -> Result<String> {
     let installed = check::installed_release(root)?;
     let mut lines = vec![format!("Managed root: {}", root.display())];
     if let Some(installed) = &installed {
@@ -33,6 +33,14 @@ fn status_at(root: &Path, command: &Path, paths: &[PathBuf]) -> Result<String> {
     } else {
         lines.push("No vscu-managed installation found.".into());
         lines.push("Run vscu install to install it.".into());
+    }
+    for name in ["previous", "staged"] {
+        if let Some(target) = crate::releases::selected(root, name)? {
+            lines.push(format!("{name}: {}", target.display()));
+        }
+    }
+    if crate::releases::has_journal(root) {
+        lines.push("Interrupted activation bookkeeping: run update --activate or rollback to recover under lock.".into());
     }
 
     match code_on_path(paths)? {
@@ -91,7 +99,7 @@ fn missing(error: &io::Error) -> bool {
 }
 
 /// Resolve filesystem commands only; shell aliases, functions and wrappers are not executed.
-fn code_on_path(paths: &[PathBuf]) -> Result<Option<(PathBuf, PathBuf)>> {
+pub(crate) fn code_on_path(paths: &[PathBuf]) -> Result<Option<(PathBuf, PathBuf)>> {
     for directory in paths {
         let candidate = directory.join("code");
         let metadata = match fs::metadata(&candidate) {

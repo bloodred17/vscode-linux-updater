@@ -1,4 +1,4 @@
-use crate::{cache::DownloadCache, config::Config};
+use crate::{cache::DownloadCache, config::Config, releases};
 use flate2::read::GzDecoder;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -22,6 +22,7 @@ pub struct Installer {
     cache: DownloadCache,
     archive: PathBuf,
     _lock: File,
+    desktop: bool,
 }
 
 impl Installer {
@@ -95,11 +96,18 @@ impl Installer {
             cache,
             archive,
             _lock: lock,
+            desktop: false,
         })
     }
 
     pub fn download_path(&self) -> PathBuf {
         self.archive.clone()
+    }
+
+    pub fn enable_desktop(&mut self) -> Result<()> {
+        crate::desktop::preflight(&self.root)?;
+        self.desktop = true;
+        Ok(())
     }
 
     pub fn reuse_cached(&mut self, requested: &str, commit: &str, checksum: &str) -> Result<bool> {
@@ -118,6 +126,7 @@ impl Installer {
         extract_archive(&self.download_path(), &unpacked)?;
         let application = unpacked.join("VSCode-linux-x64");
         let version = validate_application(&application, requested, commit)?;
+        releases::write_manifest(&application, &version, commit)?;
         self.cache
             .retain(&self.archive, &version, commit, checksum)?;
         // The commit distinguishes different builds of a release without using `latest` as an identity.
@@ -163,9 +172,12 @@ impl Installer {
         if !env::split_paths(&search_path).any(|path| path == bin) {
             println!("Add {} to PATH to launch it as code", bin.display());
         }
-        println!(
-            "Desktop launcher setup is not implemented yet; settings and extensions were preserved."
-        );
+        println!("Settings and extensions were preserved.");
+        if self.desktop {
+            crate::desktop::create(&self.root).map_err(|e| {
+                format!("VS Code was installed, but desktop launcher creation failed: {e}")
+            })?;
+        }
         Ok(destination)
     }
 }
@@ -237,6 +249,13 @@ pub fn validate_checksum(checksum: &str) -> Result<()> {
 
 pub(crate) fn verify_checksum(path: &Path, expected: &str) -> Result<()> {
     validate_checksum(expected)?;
+    if !file_checksum(path)?.eq_ignore_ascii_case(expected) {
+        return Err("Archive SHA-256 mismatch; nothing was activated".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn file_checksum(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 64 * 1024];
@@ -247,18 +266,14 @@ pub(crate) fn verify_checksum(path: &Path, expected: &str) -> Result<()> {
         }
         hasher.update(&buffer[..count]);
     }
-    let actual: String = hasher
+    Ok(hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    if !actual.eq_ignore_ascii_case(expected) {
-        return Err("Archive SHA-256 mismatch; nothing was activated".into());
-    }
-    Ok(())
+        .collect())
 }
 
-fn require_absent(path: &Path, message: &str) -> Result<()> {
+pub(crate) fn require_absent(path: &Path, message: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -274,7 +289,7 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn extract_archive(path: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn extract_archive(path: &Path, destination: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(GzDecoder::new(File::open(path)?));
     archive.set_overwrite(false);
     // Preserve executable bits, but never restore special permission bits.
@@ -316,7 +331,11 @@ fn extract_archive(path: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_application(application: &Path, requested: &str, commit: &str) -> Result<String> {
+pub(crate) fn validate_application(
+    application: &Path,
+    requested: &str,
+    commit: &str,
+) -> Result<String> {
     if !fs::symlink_metadata(application)?.is_dir() {
         return Err("Expected an application directory, not a link".into());
     }
@@ -362,6 +381,22 @@ fn validate_application(application: &Path, requested: &str, commit: &str) -> Re
 mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
+
+    #[test]
+    fn fresh_install_can_opt_in_to_desktop_integration() {
+        let home = tempfile::tempdir().unwrap();
+        let mut installer = setup(home.path()).unwrap();
+        installer.enable_desktop().unwrap();
+        let root = installer.root.clone();
+        let checksum = fixture(&installer.download_path(), None);
+        let destination = installer.finish(&checksum, "latest", COMMIT).unwrap();
+        assert!(crate::releases::removable(&destination).unwrap());
+        let launcher = crate::desktop::path(&root).unwrap();
+        assert_eq!(
+            fs::read_to_string(launcher).unwrap(),
+            crate::desktop::content(&root).unwrap()
+        );
+    }
 
     const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
