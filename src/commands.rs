@@ -12,5 +12,5 @@ pub enum Command {
     Status,
     Rollback,
     Doctor,
-    Clean
+    Clean,
 }
