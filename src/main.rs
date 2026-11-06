@@ -1,4 +1,6 @@
+mod cache;
 mod commands;
+mod config;
 mod install;
 
 use clap::Parser;
@@ -139,9 +141,11 @@ async fn download_vscode(url: &reqwest::Url, destination: &Path) -> install::Res
 
 async fn install_vscode(version: &str) -> install::Result<()> {
     install::validate_version(version)?;
-    let installer = install::Installer::prepare()?;
+    let mut installer = install::Installer::prepare()?;
     let release = fetch_download_link(version).await?;
-    download_vscode(&release.download_url, &installer.download_path()).await?;
+    if !installer.reuse_cached(version, &release.commit, &release.checksum)? {
+        download_vscode(&release.download_url, &installer.download_path()).await?;
+    }
 
     println!("Verifying and installing ...");
     let version = version.to_owned();

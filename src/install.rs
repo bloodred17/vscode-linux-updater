@@ -1,3 +1,4 @@
+use crate::{cache::DownloadCache, config::Config};
 use flate2::read::GzDecoder;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -18,6 +19,8 @@ pub struct Installer {
     root: PathBuf,
     command: PathBuf,
     staging: TempDir,
+    cache: DownloadCache,
+    archive: PathBuf,
     _lock: File,
 }
 
@@ -33,10 +36,16 @@ impl Installer {
         let (root, command) = install_paths(Path::new(&home), data.as_deref())?;
         let search_path = env::var_os("PATH").unwrap_or_default();
         let paths: Vec<_> = env::split_paths(&search_path).collect();
-        Self::prepare_at(root, command, &paths)
+        let config = Config::load()?;
+        Self::prepare_at(root, command, &paths, &config)
     }
 
-    fn prepare_at(root: PathBuf, command: PathBuf, paths: &[PathBuf]) -> Result<Self> {
+    fn prepare_at(
+        root: PathBuf,
+        command: PathBuf,
+        paths: &[PathBuf],
+        config: &Config,
+    ) -> Result<Self> {
         // Check conflicts before creating staging files or downloading anything.
         require_absent(
             &root.join("current"),
@@ -81,16 +90,29 @@ impl Installer {
         let staging = tempfile::Builder::new()
             .prefix(".install-")
             .tempdir_in(&root)?;
+        let cache = DownloadCache::prepare(config)?;
+        let archive = cache.download_path();
         Ok(Self {
             root,
             command,
             staging,
+            cache,
+            archive,
             _lock: lock,
         })
     }
 
     pub fn download_path(&self) -> PathBuf {
-        self.staging.path().join("archive.tar.gz")
+        self.archive.clone()
+    }
+
+    pub fn reuse_cached(&mut self, requested: &str, commit: &str, checksum: &str) -> Result<bool> {
+        if let Some(archive) = self.cache.lookup(requested, commit, checksum)? {
+            println!("Using cached package {}", archive.display());
+            self.archive = archive;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub fn finish(self, checksum: &str, requested: &str, commit: &str) -> Result<PathBuf> {
@@ -100,6 +122,8 @@ impl Installer {
         extract_archive(&self.download_path(), &unpacked)?;
         let application = unpacked.join("VSCode-linux-x64");
         let version = validate_application(&application, requested, commit)?;
+        self.cache
+            .retain(&self.archive, &version, commit, checksum)?;
         // The commit distinguishes different builds of a release without using `latest` as an identity.
         let destination = self
             .root
@@ -207,7 +231,7 @@ pub fn validate_checksum(checksum: &str) -> Result<()> {
     Ok(())
 }
 
-fn verify_checksum(path: &Path, expected: &str) -> Result<()> {
+pub(crate) fn verify_checksum(path: &Path, expected: &str) -> Result<()> {
     validate_checksum(expected)?;
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -238,7 +262,7 @@ fn require_absent(path: &Path, message: &str) -> Result<()> {
     }
 }
 
-fn ensure_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     if !fs::symlink_metadata(path)?.is_dir() {
         return Err(format!("Expected a real directory: {}", path.display()).into());
@@ -339,7 +363,14 @@ mod tests {
 
     fn setup(home: &Path) -> Result<Installer> {
         let (root, command) = install_paths(home, None)?;
-        Installer::prepare_at(root, command, &[])
+        Installer::prepare_at(root, command, &[], &cache_config(home))
+    }
+
+    fn cache_config(home: &Path) -> Config {
+        Config {
+            download_dir: home.join(".vscu"),
+            max_cache_count: 3,
+        }
     }
 
     fn append(builder: &mut tar::Builder<GzEncoder<File>>, name: &str, content: &[u8], mode: u32) {
@@ -351,6 +382,14 @@ mod tests {
     }
 
     fn fixture(path: &Path, extra: Option<(&str, &str, tar::EntryType)>) -> String {
+        fixture_version(path, "1.100.0", extra)
+    }
+
+    fn fixture_version(
+        path: &Path,
+        version: &str,
+        extra: Option<(&str, &str, tar::EntryType)>,
+    ) -> String {
         let mut builder = tar::Builder::new(GzEncoder::new(
             File::create(path).unwrap(),
             Compression::fast(),
@@ -370,11 +409,11 @@ mod tests {
         append(
             &mut builder,
             "VSCode-linux-x64/resources/app/package.json",
-            br#"{"version":"1.100.0"}"#,
+            format!(r#"{{"version":"{version}"}}"#).as_bytes(),
             0o644,
         );
         let product =
-            format!(r#"{{"version":"1.100.0","commit":"{COMMIT}","applicationName":"code"}}"#);
+            format!(r#"{{"version":"{version}","commit":"{COMMIT}","applicationName":"code"}}"#);
         append(
             &mut builder,
             "VSCode-linux-x64/resources/app/product.json",
@@ -403,6 +442,220 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    // Independent fresh installations share a download cache, without enabling updates.
+    fn cached_setup(home: &Path, name: &str, max_count: usize) -> Installer {
+        let root = home.join(name);
+        let mut config = cache_config(home);
+        config.max_cache_count = max_count;
+        Installer::prepare_at(root.clone(), root.join("bin/code"), &[], &config).unwrap()
+    }
+
+    fn cached_archive(home: &Path, version: &str) -> PathBuf {
+        home.join(".vscu")
+            .join(format!("vscu-{version}-{COMMIT}/archive.tar.gz"))
+    }
+
+    fn cache_versions(home: &Path) -> Vec<String> {
+        let mut versions = Vec::new();
+        for entry in fs::read_dir(home.join(".vscu")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.join("archive.tar.gz").is_file()
+                && let Ok(file) = File::open(path.join("vscu-package.json"))
+            {
+                let metadata: serde_json::Value = serde_json::from_reader(file).unwrap();
+                versions.push(metadata["version"].as_str().unwrap().to_owned());
+            }
+        }
+        versions.sort();
+        versions
+    }
+
+    fn populate_cache(home: &Path) {
+        for version in ["1.99.0", "1.100.0", "2.0.0"] {
+            let installer = cached_setup(home, version, 3);
+            let checksum = fixture_version(&installer.download_path(), version, None);
+            installer.finish(&checksum, version, COMMIT).unwrap();
+        }
+    }
+
+    #[test]
+    fn cache_retention_follows_all_three_examples_and_preserves_installed_releases() {
+        let home = tempfile::tempdir().unwrap();
+        let mut installed = Vec::new();
+        for (index, (version, expected)) in [
+            ("1.0.0", vec!["1.0.0"]),
+            ("2.0.0", vec!["1.0.0", "2.0.0"]),
+            ("3.0.0", vec!["1.0.0", "2.0.0", "3.0.0"]),
+            ("4.0.0", vec!["2.0.0", "3.0.0", "4.0.0"]),
+            ("1.0.0", vec!["1.0.0", "3.0.0", "4.0.0"]),
+            ("2.0.0", vec!["2.0.0", "3.0.0", "4.0.0"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let installer = cached_setup(home.path(), &format!("install-{index}"), 3);
+            let checksum = fixture_version(&installer.download_path(), version, None);
+            installed.push(installer.finish(&checksum, version, COMMIT).unwrap());
+            assert_eq!(cache_versions(home.path()), expected);
+        }
+        for release in installed {
+            assert_eq!(
+                fs::read(release.join("bin/code")).unwrap(),
+                b"fake launcher"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_package_resolves_latest_and_applies_a_reduced_limit() {
+        let home = tempfile::tempdir().unwrap();
+        populate_cache(home.path());
+        let archive = cached_archive(home.path(), "1.99.0");
+        let checksum = digest(&archive);
+        let mut installer = cached_setup(home.path(), "reuse", 1);
+        assert!(
+            !installer
+                .reuse_cached("1.99.0", &"b".repeat(40), &checksum)
+                .unwrap()
+        );
+        assert!(
+            !installer
+                .reuse_cached("1.100.0", COMMIT, &checksum)
+                .unwrap()
+        );
+        assert!(installer.reuse_cached("latest", COMMIT, &checksum).unwrap());
+        assert_eq!(installer.download_path(), archive);
+        assert!(!installer.cache.download_path().exists());
+        // No eviction until this reused package has passed full validation again.
+        assert_eq!(cache_versions(home.path()).len(), 3);
+        installer.finish(&checksum, "latest", COMMIT).unwrap();
+        assert_eq!(cache_versions(home.path()), ["1.99.0"]);
+        assert_eq!(digest(&archive), checksum);
+    }
+
+    #[test]
+    fn eviction_compares_versions_numerically() {
+        let home = tempfile::tempdir().unwrap();
+        populate_cache(home.path());
+        let installer = cached_setup(home.path(), "numeric", 3);
+        let checksum = fixture_version(&installer.download_path(), "2.1.0", None);
+        installer.finish(&checksum, "2.1.0", COMMIT).unwrap();
+        assert_eq!(cache_versions(home.path()), ["1.100.0", "2.0.0", "2.1.0"]);
+    }
+
+    #[test]
+    fn failed_download_or_package_validation_preserves_existing_cache() {
+        let home = tempfile::tempdir().unwrap();
+        populate_cache(home.path());
+        let expected = cache_versions(home.path());
+        let abandoned = cached_setup(home.path(), "abandoned", 1);
+        let partial = abandoned.download_path();
+        fs::write(&partial, "partial download").unwrap();
+        drop(abandoned);
+        assert!(!partial.exists());
+        assert_eq!(cache_versions(home.path()), expected);
+        for failure in ["checksum", "gzip", "version", "commit", "unsafe"] {
+            let installer = cached_setup(home.path(), failure, 1);
+            let archive = installer.download_path();
+            let extra = (failure == "unsafe").then_some(("../escape", "", tar::EntryType::Regular));
+            let mut checksum = fixture_version(&archive, "3.0.0", extra);
+            let mut version = "3.0.0";
+            let mut commit = COMMIT.to_owned();
+            match failure {
+                "checksum" => checksum = "0".repeat(64),
+                "gzip" => {
+                    fs::write(&archive, "invalid gzip").unwrap();
+                    checksum = digest(&archive);
+                }
+                "version" => version = "4.0.0",
+                "commit" => commit = "b".repeat(40),
+                _ => (),
+            }
+            assert!(installer.finish(&checksum, version, &commit).is_err());
+            assert!(!archive.exists());
+            assert_eq!(
+                cache_versions(home.path()),
+                expected,
+                "cache changed after {failure}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_cached_package_is_replaced_only_after_a_valid_download() {
+        let home = tempfile::tempdir().unwrap();
+        populate_cache(home.path());
+        let archive = cached_archive(home.path(), "1.99.0");
+        let checksum = digest(&archive);
+        fs::write(&archive, "corrupt cached download").unwrap();
+        let mut installer = cached_setup(home.path(), "replacement", 3);
+        assert!(!installer.reuse_cached("1.99.0", COMMIT, &checksum).unwrap());
+        assert_eq!(fs::read(&archive).unwrap(), b"corrupt cached download");
+        let replacement_checksum = fixture_version(&installer.download_path(), "1.99.0", None);
+        assert_eq!(replacement_checksum, checksum);
+        installer.finish(&checksum, "1.99.0", COMMIT).unwrap();
+        assert_eq!(digest(&archive), checksum);
+        assert_eq!(cache_versions(home.path()).len(), 3);
+    }
+
+    #[test]
+    fn cache_cleanup_leaves_unrelated_files_and_symlinks_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        populate_cache(home.path());
+        let cache = home.path().join(".vscu");
+        let oldest = cached_archive(home.path(), "1.99.0")
+            .parent()
+            .unwrap()
+            .to_owned();
+        fs::write(cache.join("notes.txt"), "keep notes").unwrap();
+        fs::write(oldest.join("user-file"), "keep inside package directory").unwrap();
+        let unowned = cache.join(format!("vscu-0.1.0-{COMMIT}"));
+        fs::create_dir(&unowned).unwrap();
+        fs::write(unowned.join("archive.tar.gz"), "unmanaged archive").unwrap();
+        fs::write(unowned.join("vscu-package.json"), "invalid manifest").unwrap();
+        symlink(home.path().join("1.100.0"), cache.join("vscu-link")).unwrap();
+        let installer = cached_setup(home.path(), "cleanup", 1);
+        let checksum = fixture_version(&installer.download_path(), "3.0.0", None);
+        installer.finish(&checksum, "3.0.0", COMMIT).unwrap();
+        assert_eq!(
+            fs::read_to_string(cache.join("notes.txt")).unwrap(),
+            "keep notes"
+        );
+        assert_eq!(
+            fs::read_to_string(oldest.join("user-file")).unwrap(),
+            "keep inside package directory"
+        );
+        assert_eq!(
+            fs::read_to_string(unowned.join("archive.tar.gz")).unwrap(),
+            "unmanaged archive"
+        );
+        assert!(
+            fs::symlink_metadata(cache.join("vscu-link"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(!oldest.join("archive.tar.gz").exists());
+    }
+
+    #[test]
+    fn shared_cache_is_locked_across_distinct_installation_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let first = cached_setup(home.path(), "first", 3);
+        let other_root = home.path().join("second");
+        let error = Installer::prepare_at(
+            other_root.clone(),
+            other_root.join("bin/code"),
+            &[],
+            &cache_config(home.path()),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("download cache lock"));
+        drop(first);
+        drop(cached_setup(home.path(), "second", 3));
     }
 
     #[test]
@@ -508,6 +761,8 @@ mod tests {
         fs::write(destination.join("keep"), "existing content").unwrap();
         let checksum = fixture(&installer.download_path(), None);
         assert!(installer.finish(&checksum, "latest", COMMIT).is_err());
+        // A validated download remains reusable even when activation has a conflict.
+        verify_checksum(&cached_archive(home.path(), "1.100.0"), &checksum).unwrap();
         assert_eq!(
             fs::read_to_string(destination.join("keep")).unwrap(),
             "existing content"
@@ -525,7 +780,15 @@ mod tests {
             } else {
                 fs::write(&command, "existing command").unwrap();
             }
-            assert!(Installer::prepare_at(root.clone(), command.clone(), &[]).is_err());
+            assert!(
+                Installer::prepare_at(
+                    root.clone(),
+                    command.clone(),
+                    &[],
+                    &cache_config(home.path())
+                )
+                .is_err()
+            );
             assert!(fs::symlink_metadata(command).is_ok());
             assert!(!root.exists());
         }
@@ -539,7 +802,10 @@ mod tests {
         fs::write(existing_bin.join("code"), "existing").unwrap();
         fs::set_permissions(existing_bin.join("code"), fs::Permissions::from_mode(0o755)).unwrap();
         let (root, command) = install_paths(home.path(), None).unwrap();
-        assert!(Installer::prepare_at(root, command, &[existing_bin]).is_err());
+        assert!(
+            Installer::prepare_at(root, command, &[existing_bin], &cache_config(home.path()))
+                .is_err()
+        );
         let installer = setup(home.path()).unwrap();
         assert!(setup(home.path()).is_err());
         drop(installer);
@@ -606,7 +872,9 @@ mod tests {
         let (root, command) = install_paths(home.path(), None).unwrap();
         fs::create_dir_all(&root).unwrap();
         symlink("versions/missing", root.join("current")).unwrap();
-        assert!(Installer::prepare_at(root.clone(), command, &[]).is_err());
+        assert!(
+            Installer::prepare_at(root.clone(), command, &[], &cache_config(home.path())).is_err()
+        );
         assert_eq!(
             fs::read_link(root.join("current")).unwrap(),
             Path::new("versions/missing")
