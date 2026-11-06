@@ -1,0 +1,8 @@
+[package]
+name = "vscode-updater"
+version = "0.1.0"
+edition = "2024"
+description = "Simple tool to update vscode for linux x64"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
