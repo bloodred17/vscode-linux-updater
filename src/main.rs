@@ -1,4 +1,5 @@
 mod cache;
+mod check;
 mod commands;
 mod config;
 mod install;
@@ -44,6 +45,7 @@ async fn main() -> install::Result<()> {
         commands::Command::Update => {
             install_vscode("latest").await?;
         }
+        commands::Command::Check => check::run().await?,
         _ => {
             print!("Others")
         }

@@ -29,11 +29,7 @@ impl Installer {
         if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {
             return Err("Only Linux x64 is supported".into());
         }
-        let home = env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .ok_or("HOME must be set to an absolute directory")?;
-        let data = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty());
-        let (root, command) = install_paths(Path::new(&home), data.as_deref())?;
+        let (root, command) = configured_install_paths()?;
         let search_path = env::var_os("PATH").unwrap_or_default();
         let paths: Vec<_> = env::split_paths(&search_path).collect();
         let config = Config::load()?;
@@ -172,6 +168,14 @@ impl Installer {
         );
         Ok(destination)
     }
+}
+
+pub(crate) fn configured_install_paths() -> Result<(PathBuf, PathBuf)> {
+    let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or("HOME must be set to an absolute directory")?;
+    let data = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty());
+    install_paths(Path::new(&home), data.as_deref())
 }
 
 fn install_paths(home: &Path, data: Option<&OsStr>) -> Result<(PathBuf, PathBuf)> {
